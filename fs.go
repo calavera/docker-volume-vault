@@ -1,8 +1,6 @@
 package main
 
 import (
-	"log"
-
 	"github.com/hanwen/go-fuse/fuse"
 	"github.com/hanwen/go-fuse/fuse/nodefs"
 	"github.com/hanwen/go-fuse/fuse/pathfs"
@@ -35,7 +33,6 @@ func NewFs(client *api.Client, owner keywhizfs.Ownership) (*fs, nodefs.Node) {
 // GetAttr is a FUSE function which tells FUSE which files and directories exist.
 func (f *fs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
 	var attr *fuse.Attr
-	log.Printf("GETTING!!!!! %s\n", name)
 	switch {
 	case name == "": // Base directory
 		attr = f.directoryAttr(1, 0755)
@@ -44,6 +41,10 @@ func (f *fs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Statu
 	default:
 		s, err := f.client.Logical().Read(name)
 		if err != nil {
+			return nil, fuse.ENOENT
+		}
+
+		if s == nil || s.Data == nil {
 			return nil, fuse.ENOENT
 		}
 
@@ -59,7 +60,6 @@ func (f *fs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Statu
 // Open is a FUSE function where an in-memory open file struct is constructed.
 func (f *fs) Open(name string, flags uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
 	var file nodefs.File
-	log.Printf("OPENING!!!!! %s\n", name)
 	switch {
 	case name == "":
 		return nil, EISDIR
@@ -68,6 +68,10 @@ func (f *fs) Open(name string, flags uint32, context *fuse.Context) (nodefs.File
 	default:
 		s, err := f.client.Logical().Read(name)
 		if err != nil {
+			return nil, fuse.ENOENT
+		}
+
+		if s == nil || s.Data == nil {
 			return nil, fuse.ENOENT
 		}
 
