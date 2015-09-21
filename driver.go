@@ -1,38 +1,57 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"os"
+	"encoding/base64"
+	"io/ioutil"
 	"path/filepath"
-	"sync"
+	"strings"
 
 	"github.com/calavera/dkvolume"
-	"github.com/hanwen/go-fuse/fuse"
-	"github.com/hanwen/go-fuse/fuse/nodefs"
+	"github.com/calavera/docker-volume-vault/store"
+	"github.com/calavera/docker-volume-vault/vault"
 	"github.com/hashicorp/vault/api"
-	"github.com/square/keywhiz-fs"
 )
 
 type driver struct {
-	root   string
-	addr   string
-	server *fuse.Server
-	m      sync.Mutex
+	root  string
+	token string
+	store store.Store
 }
 
-func newDriver(root, addr string) *driver {
+func newDriver(root, token string) *driver {
 	return &driver{
-		root: root,
-		addr: addr,
+		root:  root,
+		token: token,
+		store: store.NewMemoryStore(),
 	}
 }
 
 func (d *driver) Create(r dkvolume.Request) dkvolume.Response {
+	vol := store.NewVolume(r.Name, d.token, r.Options)
+	if err := d.store.Setx(vol); err != nil {
+		return dkvolume.Response{Err: err.Error()}
+	}
+
+	if rules, ok := r.Options["policy-rules"]; ok {
+		name := r.Options["policy-name"]
+		if name == "" {
+			name = "docker-policy-" + r.Name
+		}
+		token, err := d.createPolicy(name, rules)
+		if err != nil {
+			return dkvolume.Response{Err: err.Error()}
+		}
+		vol.Token = token
+		d.store.Set(vol)
+	}
 	return dkvolume.Response{}
 }
 
 func (d *driver) Remove(r dkvolume.Request) dkvolume.Response {
+	err := d.store.Del(r.Name)
+	if err != nil {
+		return dkvolume.Response{Err: err.Error()}
+	}
 	return dkvolume.Response{}
 }
 
@@ -41,43 +60,27 @@ func (d *driver) Path(r dkvolume.Request) dkvolume.Response {
 }
 
 func (d *driver) Mount(r dkvolume.Request) dkvolume.Response {
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-	log.Printf("Mounting volume %s on %s\n", r.Name, m)
-
-	fi, err := os.Lstat(m)
-
-	if os.IsNotExist(err) {
-		if err := os.MkdirAll(m, 0755); err != nil {
-			return dkvolume.Response{Err: err.Error()}
-		}
-	} else if err != nil {
-		return dkvolume.Response{Err: err.Error()}
-	}
-
-	if fi != nil && !fi.IsDir() {
-		return dkvolume.Response{Err: fmt.Sprintf("%v already exist and it's not a directory", m)}
-	}
-
-	server, err := d.mountServer(m)
+	vol, err := d.store.Get(r.Name)
 	if err != nil {
 		return dkvolume.Response{Err: err.Error()}
 	}
 
-	d.server = server
+	mount, err := vol.Mount(d.root)
+	if err != nil {
+		return dkvolume.Response{Err: err.Error()}
+	}
 
-	return dkvolume.Response{Mountpoint: m}
+	return dkvolume.Response{Mountpoint: mount}
 }
 
 func (d driver) Unmount(r dkvolume.Request) dkvolume.Response {
-	d.m.Lock()
-	defer d.m.Unlock()
-	m := d.mountpoint(r.Name)
-	log.Printf("Unmounting volume %s from %s\n", r.Name, m)
+	vol, err := d.store.Get(r.Name)
+	if err != nil {
+		return dkvolume.Response{Err: err.Error()}
+	}
 
-	if d.server != nil {
-		if err := d.server.Unmount(); err != nil {
+	if vol.Mounted() {
+		if err := vol.Unmount(); err != nil {
 			return dkvolume.Response{Err: err.Error()}
 		}
 	}
@@ -89,35 +92,38 @@ func (d *driver) mountpoint(name string) string {
 	return filepath.Join(d.root, name)
 }
 
-func (d *driver) mountServer(mountpoint string) (*fuse.Server, error) {
-	if err := os.MkdirAll(filepath.Dir(mountpoint), 0755); err != nil {
-		return nil, err
-	}
+func (d *driver) client() (*api.Client, error) {
+	return vault.Client(d.token)
+}
 
-	conf := api.DefaultConfig()
-	client, err := api.NewClient(conf)
+func (d *driver) createPolicy(name, policy string) (string, error) {
+	var rules []byte
+	var err error
+	if strings.HasPrefix(policy, "@") {
+		rules, err = ioutil.ReadFile(strings.TrimPrefix(policy, "@"))
+	} else {
+		rules, err = base64.StdEncoding.DecodeString(policy)
+	}
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	ownership := keywhizfs.NewOwnership("root", "root")
-	kwfs, root := NewFs(client, ownership)
-
-	mountOptions := &fuse.MountOptions{
-		AllowOther: true,
-		Name:       kwfs.String(),
-		Options:    []string{"default_permissions"},
-	}
-
-	// Empty Options struct avoids setting a global uid/gid override.
-	conn := nodefs.NewFileSystemConnector(root, &nodefs.Options{})
-	server, err := fuse.NewServer(conn.RawFS(), mountpoint, mountOptions)
+	client, err := d.client()
 	if err != nil {
-		log.Printf("Mount fail: %v\n", err)
-		return nil, err
+		return "", err
 	}
 
-	go server.Serve()
+	if err := client.Sys().PutPolicy(name, string(rules)); err != nil {
+		return "", err
+	}
 
-	return server, nil
+	req := &api.TokenCreateRequest{
+		Policies: []string{name},
+	}
+
+	secret, err := client.Auth().Token().Create(req)
+	if err != nil {
+		return "", err
+	}
+	return secret.Auth.ClientToken, nil
 }

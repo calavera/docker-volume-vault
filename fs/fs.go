@@ -1,11 +1,13 @@
-package main
+package fs
 
 import (
+	"log"
+	"strings"
+
 	"github.com/hanwen/go-fuse/fuse"
 	"github.com/hanwen/go-fuse/fuse/nodefs"
 	"github.com/hanwen/go-fuse/fuse/pathfs"
 	"github.com/hashicorp/vault/api"
-	"github.com/square/keywhiz-fs"
 	"golang.org/x/sys/unix"
 )
 
@@ -16,15 +18,14 @@ const (
 type fs struct {
 	pathfs.FileSystem
 	client *api.Client
-	owner  keywhizfs.Ownership
 }
 
 // NewKeywhizFs readies a KeywhizFs struct and its parent filesystem objects.
-func NewFs(client *api.Client, owner keywhizfs.Ownership) (*fs, nodefs.Node) {
+func NewFs(client *api.Client) (*fs, nodefs.Node) {
 	defaultfs := pathfs.NewDefaultFileSystem()            // Returns ENOSYS by default
 	readonlyfs := pathfs.NewReadonlyFileSystem(defaultfs) // R/W calls return EPERM
 
-	kwfs := &fs{readonlyfs, client, owner}
+	kwfs := &fs{readonlyfs, client}
 	nfs := pathfs.NewPathNodeFs(kwfs, nil)
 	nfs.SetDebug(true)
 	return kwfs, nfs.Root()
@@ -32,23 +33,32 @@ func NewFs(client *api.Client, owner keywhizfs.Ownership) (*fs, nodefs.Node) {
 
 // GetAttr is a FUSE function which tells FUSE which files and directories exist.
 func (f *fs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
+	log.Printf("GetAttr '%s'\n", name)
 	var attr *fuse.Attr
 	switch {
 	case name == "": // Base directory
-		attr = f.directoryAttr(1, 0755)
+		m, err := f.client.Sys().ListMounts()
+		if err != nil {
+			log.Println(err)
+			attr = f.directoryAttr(1, 0755)
+		}
+		attr = f.directoryAttr(len(m), 0755)
 	case name == "secret":
 		attr = f.directoryAttr(1, 0755)
-	default:
+	case name == "sys":
+		attr = f.directoryAttr(1, 0755)
+	case strings.HasPrefix(name, "secret/"):
 		s, err := f.client.Logical().Read(name)
 		if err != nil {
+			log.Println(err)
 			return nil, fuse.ENOENT
 		}
 
 		if s == nil || s.Data == nil {
-			return nil, fuse.ENOENT
+			attr = f.directoryAttr(1, 0755)
+		} else {
+			attr = f.secretAttr(s.Data["value"].(string) + "\n")
 		}
-
-		attr = f.secretAttr(s.Data["value"].(string))
 	}
 
 	if attr != nil {
@@ -59,15 +69,17 @@ func (f *fs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Statu
 
 // Open is a FUSE function where an in-memory open file struct is constructed.
 func (f *fs) Open(name string, flags uint32, context *fuse.Context) (nodefs.File, fuse.Status) {
+	log.Printf("Open '%s'\n", name)
 	var file nodefs.File
 	switch {
 	case name == "":
 		return nil, EISDIR
-	case name == "secret":
+	case name == "secret" || name == "sys":
 		return nil, EISDIR
-	default:
+	case strings.HasPrefix(name, "secret/"):
 		s, err := f.client.Logical().Read(name)
 		if err != nil {
+			log.Println(err)
 			return nil, fuse.ENOENT
 		}
 
@@ -75,7 +87,7 @@ func (f *fs) Open(name string, flags uint32, context *fuse.Context) (nodefs.File
 			return nil, fuse.ENOENT
 		}
 
-		file = nodefs.NewDataFile([]byte(s.Data["value"].(string)))
+		file = nodefs.NewDataFile([]byte(s.Data["value"].(string) + "\n"))
 	}
 
 	if file != nil {
@@ -87,7 +99,27 @@ func (f *fs) Open(name string, flags uint32, context *fuse.Context) (nodefs.File
 
 // OpenDir is a FUSE function called when performing a directory listing.
 func (f *fs) OpenDir(name string, context *fuse.Context) ([]fuse.DirEntry, fuse.Status) {
+	log.Printf("OpenDir '%s'\n", name)
 	var entries []fuse.DirEntry
+
+	if name == "" {
+		mounts, err := f.client.Sys().ListMounts()
+		if err != nil {
+			log.Println(err)
+			return entries, fuse.OK
+		}
+		if len(mounts) == 0 {
+			return entries, fuse.OK
+		}
+
+		entries = make([]fuse.DirEntry, 0, len(mounts))
+		for name, _ := range mounts {
+			entries = append(entries, fuse.DirEntry{
+				Mode: unix.S_IFDIR,
+				Name: strings.TrimSuffix(name, "/"),
+			})
+		}
+	}
 	return entries, fuse.OK
 }
 
@@ -108,8 +140,9 @@ func (f *fs) secretAttr(s string) *fuse.Attr {
 }
 
 // directoryAttr constructs a generic directory fuse.Attr with the given parameters.
-func (f *fs) directoryAttr(subdirCount, mode uint32) *fuse.Attr {
+func (f *fs) directoryAttr(subdirCount int, mode uint32) *fuse.Attr {
 	attr := &fuse.Attr{
+		Size: uint64(subdirCount),
 		Mode: fuse.S_IFDIR | mode,
 	}
 	return attr

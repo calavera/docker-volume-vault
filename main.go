@@ -4,37 +4,41 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	"github.com/calavera/dkvolume"
+	"github.com/calavera/docker-volume-vault/vault"
+	"github.com/hashicorp/vault/api"
 	"golang.org/x/sys/unix"
 )
 
-const (
-	id = "_vault"
-)
+const id = "vault"
 
 var (
 	defaultPath = filepath.Join(dkvolume.DefaultDockerRootDirectory, id)
 	root        = flag.String("root", defaultPath, "Docker volumes root directory")
+	url         = flag.String("url", "", "Vault server URL")
+	token       = flag.String("token", "", "Vault root token")
 )
 
 func main() {
 	var Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] url\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
-	if flag.NArg() != 1 {
+	if *url == "" || *token == "" {
 		Usage()
 		os.Exit(1)
 	}
 
 	lockMemory()
 
-	d := newDriver(*root, flag.Args()[0])
+	vault.DefaultConfig = &api.Config{Address: *url, HttpClient: http.DefaultClient}
+	d := newDriver(*root, *token)
 	h := dkvolume.NewHandler(d)
 	fmt.Println(h.ServeUnix("root", "vault"))
 }
