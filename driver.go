@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/calavera/dkvolume"
 	"github.com/calavera/docker-volume-vault/store"
 	"github.com/calavera/docker-volume-vault/vault"
+	"github.com/docker/go-plugins-helpers/volume"
 	"github.com/hashicorp/vault/api"
 )
 
@@ -26,10 +26,10 @@ func newDriver(root, token string) *driver {
 	}
 }
 
-func (d *driver) Create(r dkvolume.Request) dkvolume.Response {
+func (d *driver) Create(r volume.Request) volume.Response {
 	vol := store.NewVolume(r.Name, d.token, r.Options)
 	if err := d.store.Setx(vol); err != nil {
-		return dkvolume.Response{Err: err.Error()}
+		return volume.Response{Err: err.Error()}
 	}
 
 	if rules, ok := r.Options["policy-rules"]; ok {
@@ -39,53 +39,61 @@ func (d *driver) Create(r dkvolume.Request) dkvolume.Response {
 		}
 		token, err := d.createPolicy(name, rules)
 		if err != nil {
-			return dkvolume.Response{Err: err.Error()}
+			return volume.Response{Err: err.Error()}
 		}
 		vol.Token = token
 		d.store.Set(vol)
 	}
-	return dkvolume.Response{}
+	return volume.Response{}
 }
 
-func (d *driver) Remove(r dkvolume.Request) dkvolume.Response {
+func (d *driver) Get(r volume.Request) volume.Response {
+	return volume.Response{}
+}
+
+func (d *driver) List(r volume.Request) volume.Response {
+	return volume.Response{}
+}
+
+func (d *driver) Remove(r volume.Request) volume.Response {
 	err := d.store.Del(r.Name)
 	if err != nil {
-		return dkvolume.Response{Err: err.Error()}
+		return volume.Response{Err: err.Error()}
 	}
-	return dkvolume.Response{}
+	return volume.Response{}
 }
 
-func (d *driver) Path(r dkvolume.Request) dkvolume.Response {
-	return dkvolume.Response{Mountpoint: d.mountpoint(r.Name)}
+func (d *driver) Path(r volume.Request) volume.Response {
+	return volume.Response{Mountpoint: d.mountpoint(r.Name)}
 }
 
-func (d *driver) Mount(r dkvolume.Request) dkvolume.Response {
+func (d *driver) Mount(r volume.Request) volume.Response {
 	vol, err := d.store.Get(r.Name)
 	if err != nil {
-		return dkvolume.Response{Err: err.Error()}
+		return volume.Response{Err: err.Error()}
 	}
 
 	mount, err := vol.Mount(d.root)
 	if err != nil {
-		return dkvolume.Response{Err: err.Error()}
+		return volume.Response{Err: err.Error()}
 	}
 
-	return dkvolume.Response{Mountpoint: mount}
+	return volume.Response{Mountpoint: mount}
 }
 
-func (d driver) Unmount(r dkvolume.Request) dkvolume.Response {
+func (d driver) Unmount(r volume.Request) volume.Response {
 	vol, err := d.store.Get(r.Name)
 	if err != nil {
-		return dkvolume.Response{Err: err.Error()}
+		return volume.Response{Err: err.Error()}
 	}
 
 	if vol.Mounted() {
 		if err := vol.Unmount(); err != nil {
-			return dkvolume.Response{Err: err.Error()}
+			return volume.Response{Err: err.Error()}
 		}
 	}
 
-	return dkvolume.Response{}
+	return volume.Response{}
 }
 
 func (d *driver) mountpoint(name string) string {
